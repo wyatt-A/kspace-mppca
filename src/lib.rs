@@ -197,13 +197,12 @@ fn mp_estimate_rank(singular_values:&[f32],m:usize,n:usize) -> (usize,f32) {
 
 
 
-struct PCAInfo {
-    init_energy:f32,
-    final_energy:f32,
-    rank:usize,
-    variance:Option<f32>
+pub struct PCAInfo {
+    pub init_energy:f32,
+    pub final_energy:f32,
+    pub rank:usize,
+    pub variance:Option<f32>
 }
-
 
 fn denoise_matrix(matrix:&mut Array2<Complex32>,singular_value_threshold:f32) -> PCAInfo {
 
@@ -257,7 +256,7 @@ fn denoise_matrix(matrix:&mut Array2<Complex32>,singular_value_threshold:f32) ->
 }
 
 
-fn mp_denoise_matrix(matrix:&mut Array2<Complex32>,variance:Option<f32>) -> PCAInfo {
+pub fn mp_denoise_matrix(matrix:&mut Array2<Complex32>,variance:Option<f32>,rank:Option<usize>) -> PCAInfo {
 
     // m is the number of features (rows)
     let m = matrix.shape()[0];
@@ -275,17 +274,25 @@ fn mp_denoise_matrix(matrix:&mut Array2<Complex32>,variance:Option<f32>) -> PCAI
     // retrieve mutable reference to the singular values
     let singular_values = s.as_slice_mut().unwrap();
 
+
     // determine the rank and noise (if applicable) of the matrix
     let (rank,var) = match &variance {
         Some(var) => {
-            let rank = mp_find_rank(singular_values, *var, m, n);
+            let rank = if let Some(rank) = rank {
+                rank
+            }else {
+                mp_find_rank(singular_values, *var, m, n)
+            };
             (rank,*var)
         }
         None => {
-            let (rank,var_estimate) = mp_estimate_rank(singular_values, m, n);
-            (rank,var_estimate)
+            let (estimated_rank,var_estimate) = mp_estimate_rank(singular_values, m, n);
+            (rank.unwrap_or(estimated_rank),var_estimate)
         }
     };
+
+
+
 
     // do hard thresholding by nullifying singular values above estimated rank
     singular_values[rank..].fill(0.);
@@ -317,7 +324,7 @@ fn get_largest_singular_value(casorati_matrix:&Array2<Complex32>) -> f32 {
     *s.first().unwrap()
 }
 
-fn estimate_largerst_singular_value(noise_variance:f32,m:usize,n:usize,monte_carlo_n_iter:usize) -> f32 {
+fn estimate_largest_singular_value(noise_variance:f32,m:usize,n:usize,monte_carlo_n_iter:usize) -> f32 {
 
     // Create a normal distribution with the specified mean and standard deviation
     let normal_dist = Normal::new(0., noise_variance.sqrt()).expect("Failed to create normal distribution");
@@ -347,7 +354,7 @@ fn estimate_largerst_singular_value(noise_variance:f32,m:usize,n:usize,monte_car
 #[test]
 fn noise_matrix() {
     let now = Instant::now();
-    let max_val = estimate_largerst_singular_value(0.6752, 1000, 67, 10);
+    let max_val = estimate_largest_singular_value(0.6752, 1000, 67, 10);
     let later = now.elapsed();
     println!("took {} ms",later.as_millis());
     println!("max val = {}",max_val);
