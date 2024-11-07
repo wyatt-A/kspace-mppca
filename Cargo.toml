@@ -22,3 +22,4 @@ mr_data = {path = "../civm_scan/mr_data"}
 walkdir = "2.5.0"
 nifti = "0.16.0"
 recon2 = {path = "../civm_scan/recon2"}
+rand_distr = "0.4.3"

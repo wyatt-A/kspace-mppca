@@ -5,6 +5,7 @@ use cfl::{ndarray::ShapeBuilder, num_complex::Complex32};
 use cfl::ndarray::{Array1, Array2};
 use kspace_mppca::{extract_data, insert_data, singular_value_threshold_mppca};
 use mr_data::kspace::KSpace;
+use rand_distr::ChiSquaredError;
 use recon2::{config::config::TomlConfig, object_manager::object_manager::ObjectManager};
 
 fn main() {
@@ -32,6 +33,10 @@ fn main() {
     let norm = |kx:i32,ky:i32,kz:i32| -> i32 {
         kx*kx + ky*ky + kz*kz
     };
+
+    // let norm = |kx:i32,ky:i32,kz:i32| -> i32 {
+    //     kx.abs().max(ky.abs()).max(kz.abs())
+    // };
 
     let mut sample_ordering = vec![];
     let mut idx = 0;
@@ -100,18 +105,25 @@ fn main() {
  
     //let mut init_energy = CflWriter::new("init_energy",&[16200]).unwrap();
     //let mut final_energy = CflWriter::new("final_energy",&[16200]).unwrap();
-    //let mut singular_values = CflWriter::new("singular_values",&[61,16200]).unwrap();
+
+    let n_chunks = ceiling_div(16200*590, chunk_size);
+
+    let mut singular_values = CflWriter::new("singular_values",&[n_chunks]).unwrap();
 
     //let mut idx:Vec<usize> = (0..590).collect();
     //let mut sv_idx:Vec<usize> = (0..61).collect();
  
     let indices:Vec<usize> = (0..n_samples_per_vol).collect();
-
+    
     for (i,chunk) in indices.chunks(chunk_size).enumerate() {
         println!("working on {}",i);
         let mut c_mat = extract_data(&chunk, &readers);
         //println!("shape: {:?}",c_mat.shape());
-        let _ = singular_value_threshold_mppca(&mut c_mat, None);
+        //let _ = singular_value_threshold_mppca(&mut c_mat, None);
+        let info = singular_value_threshold_mppca(&mut c_mat, None);
+        let s_val = info.singular_values.get(0).unwrap();
+
+        singular_values.write(i, *s_val).unwrap();
 
         insert_data(&chunk, &mut writers, &c_mat);
         //idx.iter_mut().for_each(|x| *x += 590);

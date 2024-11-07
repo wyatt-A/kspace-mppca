@@ -1,7 +1,9 @@
-use std::collections::btree_map::RangeMut;
+use std::{collections::btree_map::RangeMut, time::Instant};
 
 use cfl::{ndarray::{parallel::prelude::*, Array2, Axis, ShapeBuilder}, num_complex::Complex32, CflReader, CflWriter};
 use ndarray_linalg::SVDDC;
+use rand::thread_rng;
+use rand_distr::{Distribution, Normal};
 
 pub struct DenoiseInfo {
     pub singular_values:Vec<Complex32>,
@@ -199,8 +201,61 @@ struct PCAInfo {
     init_energy:f32,
     final_energy:f32,
     rank:usize,
-    variance:f32
+    variance:Option<f32>
 }
+
+
+fn denoise_matrix(matrix:&mut Array2<Complex32>,singular_value_threshold:f32) -> PCAInfo {
+
+    // m is the number of features (rows)
+    //let m = matrix.shape()[0];
+    // n is the number observations (columns)
+    let n = matrix.shape()[1];
+
+    // get the initial energy of the matrix prior to noise reduction
+    let init_energy:f32 = matrix.par_iter().map(|x| x.norm_sqr()).sum();
+
+    // calculate SVD
+    let (u,mut s,v) = matrix.svddc(ndarray_linalg::UVTFlag::Some).unwrap();
+    let u = u.unwrap();
+    let v = v.unwrap();
+
+    // retrieve mutable reference to the singular values
+    let singular_values = s.as_slice_mut().unwrap();
+
+    // returns None if the matrix has full rank
+    let rank = singular_values.iter().enumerate()
+    .find_map(|(rank,&lambda)| if lambda < singular_value_threshold {
+        Some(rank)
+    } else {
+        None
+    });
+
+    if let Some(rank) = rank {
+        singular_values[rank..].fill(0.);
+    }
+    // do hard thresholding by nullifying singular values above estimated rank
+    
+    // reconstruct full diagonal matrix from nullified singular values
+    let s = Array2::from_diag(&s.map(|&x|Complex32::new(x, 0.)));
+
+    // reconstruct data matrix and assign values to original
+    let recon = u.dot(&s).dot(&v);
+    matrix.assign(&recon);
+
+    // find the resulting energy of the denoised matrix
+    let final_energy:f32 = matrix.par_iter().map(|x| x.norm_sqr()).sum();
+
+    // record meta data and return
+    PCAInfo {
+        init_energy,
+        final_energy,
+        rank:rank.unwrap_or(n),
+        variance: None,
+    }
+
+}
+
 
 fn mp_denoise_matrix(matrix:&mut Array2<Complex32>,variance:Option<f32>) -> PCAInfo {
 
@@ -250,12 +305,50 @@ fn mp_denoise_matrix(matrix:&mut Array2<Complex32>,variance:Option<f32>) -> PCAI
         init_energy,
         final_energy,
         rank,
-        variance: var,
+        variance: Some(var),
     }
 
 }
 
+/// performs a monte-carlo simulation to find the largest singular value of a measured noise
+/// matrix
+fn get_largest_singular_value(casorati_matrix:&Array2<Complex32>) -> f32 {
+    let (_,s,_) = casorati_matrix.svddc(ndarray_linalg::UVTFlag::Some).unwrap();
+    *s.first().unwrap()
+}
+
+fn estimate_largerst_singular_value(noise_variance:f32,m:usize,n:usize,monte_carlo_n_iter:usize) -> f32 {
+
+    // Create a normal distribution with the specified mean and standard deviation
+    let normal_dist = Normal::new(0., noise_variance.sqrt()).expect("Failed to create normal distribution");
+
+    // Create a random number generator
+    let mut rng = thread_rng();
+
+    // Create function that generates random complex-valued gaussian noise
+    let mut sample_complex = || {
+        Complex32::new(normal_dist.sample(&mut rng),normal_dist.sample(&mut rng))
+    };
+
+    let mut max_singular_value = 0.;
+    for _ in 0..monte_carlo_n_iter {
+        let complex_rand_matrix = Array2::<Complex32>::from_shape_simple_fn((m,n).f(), &mut sample_complex);
+        let (_,s,_) = complex_rand_matrix.svddc(ndarray_linalg::UVTFlag::Some).unwrap();
+        let this_singular_value = *s.get(0).unwrap();
+        if this_singular_value > max_singular_value {
+            max_singular_value = this_singular_value;
+        }
+    }
+
+    max_singular_value
+
+}
+
 #[test]
-fn test_denoise_matrix() {
-    
+fn noise_matrix() {
+    let now = Instant::now();
+    let max_val = estimate_largerst_singular_value(0.6752, 1000, 67, 10);
+    let later = now.elapsed();
+    println!("took {} ms",later.as_millis());
+    println!("max val = {}",max_val);
 }
