@@ -1,9 +1,12 @@
-use std::{collections::btree_map::RangeMut, time::Instant};
+use std::{collections::btree_map::RangeMut, fs::{create_dir_all, File}, io::{Read, Write}, ops::Range, path::{Path, PathBuf}, time::Instant};
 
-use cfl::{ndarray::{parallel::prelude::*, Array2, Axis, ShapeBuilder}, num_complex::Complex32, CflReader, CflWriter};
+use cfl::{ndarray::{parallel::prelude::*, Array1, Array2, Axis, ShapeBuilder}, num_complex::Complex32, CflReader, CflWriter};
+use cs_table::ViewTable;
+use mr_data::kspace::KSpace;
 use ndarray_linalg::SVDDC;
 use rand::thread_rng;
 use rand_distr::{Distribution, Normal};
+use serde::{Deserialize, Serialize};
 
 pub struct DenoiseInfo {
     pub singular_values:Vec<Complex32>,
@@ -358,4 +361,529 @@ fn noise_matrix() {
     let later = now.elapsed();
     println!("took {} ms",later.as_millis());
     println!("max val = {}",max_val);
+}
+
+
+
+pub struct KSpacePrepInputs {
+    pub kspace_dir: PathBuf,
+    pub work_dir: PathBuf,
+    pub n_volumes:usize,
+}
+
+pub struct KSpacePrepOutputs {
+    pub work_dir:PathBuf,
+    pub phase_encoding_table_path:PathBuf,
+    pub n_volumes:usize,
+    pub nx:usize,
+}
+
+//cargo test --release --package kspace-mppca --bin kmppca -- resolve_input --exact --nocapture 
+pub fn prepare_input_from_kspace_dir(inputs:KSpacePrepInputs) -> KSpacePrepOutputs {
+
+    // defined by this process
+    let phase_encoding_table_name = "views";
+
+    create_dir_all(&inputs.work_dir).expect("failed to create work dir");
+    let kspace_files:Vec<_> = (0..inputs.n_volumes).map(|i|inputs.kspace_dir.join(format!("k{}",i)).join("k0")).collect();
+    // load first kspace to get the common phase encoding coordinates
+    let k = KSpace::from_file(&kspace_files[0]).expect("failed to load kspace data");
+    let phase_encoding_coords_raw = k.coords();
+    let nx = k.line_len();
+    kspace_files.par_iter().for_each(|file|{
+        let ksp = KSpace::from_file(file).expect("failed to load raw kspace data");
+        let a = ksp.to_array2(&phase_encoding_coords_raw).into_dyn();
+        let compressed_kspace_file = inputs.work_dir.join(file.parent().unwrap().file_name().unwrap());
+        cfl::from_array(compressed_kspace_file, &a).unwrap();
+    });
+
+    let pe_table_path = inputs.work_dir.join(phase_encoding_table_name);
+    ViewTable::from_coord_pairs(&phase_encoding_coords_raw).unwrap().write(&pe_table_path).unwrap();
+
+    KSpacePrepOutputs {
+        work_dir: inputs.work_dir,
+        phase_encoding_table_path: pe_table_path,
+        n_volumes: inputs.n_volumes,
+        nx,
+    }
+
+}
+
+pub fn prepare_from_kspace_files(files:&[PathBuf],work_dir:impl AsRef<Path>) -> KSpacePrepOutputs {
+
+    let work_dir = work_dir.as_ref();
+    let phase_encoding_table_name = "views";
+
+    let n_volumes = files.len();
+
+    create_dir_all(&work_dir).expect("failed to create work dir");
+    // load first kspace to get the common phase encoding coordinates
+    let k = KSpace::from_file(&files[0]).expect("failed to load kspace data");
+    let phase_encoding_coords_raw = k.coords();
+    let nx = k.line_len();
+    files.par_iter().for_each(|file|{
+        let ksp = KSpace::from_file(file).expect("failed to load raw kspace data");
+        let a = ksp.to_array2(&phase_encoding_coords_raw).into_dyn();
+        let compressed_kspace_file = work_dir.join(file.parent().unwrap().file_name().unwrap());
+        cfl::from_array(compressed_kspace_file, &a).unwrap();
+    });
+
+    let pe_table_path = work_dir.join(phase_encoding_table_name);
+    ViewTable::from_coord_pairs(&phase_encoding_coords_raw).unwrap().write(&pe_table_path).unwrap();
+
+    KSpacePrepOutputs {
+        work_dir: work_dir.to_path_buf(),
+        phase_encoding_table_path: pe_table_path,
+        n_volumes,
+        nx,
+    }
+
+}
+
+
+
+// //cargo test --release --package kspace-mppca --bin kmppca -- parse_headfiles --exact --nocapture 
+// #[test]
+// fn parse_headfiles() {
+//     let kspace_dir = Path::new("/Users/Wyatt/scratch/S69964/object-data");
+//     let n_vols = 67;
+
+//     let headfiles:Vec<_> = (0..n_vols).map(|i|kspace_dir.join(format!("{}.headfile",i))).collect();
+
+//     let bval_key = "bvalue";
+//     let b_values:Vec<_> = headfiles.par_iter().map(|file|{
+//         let hf = Headfile::open(file).to_hash();
+//         let bval = hf.get(bval_key)
+//         .expect(&format!("failed to get {} from headfile",bval_key));
+//         bval.parse::<f32>().expect("failed to parse b-value to float")
+//     }).collect();
+
+//     println!("bvals: {:#?}",b_values);
+
+//     let max_bval = *b_values.iter().max_by(|a,b| a.partial_cmp(&b).unwrap()).unwrap();
+//     let min_bval = *b_values.iter().min_by(|a,b| a.partial_cmp(&b).unwrap()).unwrap();
+
+//     let b0_indices = [0,11,22,33,44,55];
+
+// }
+
+
+#[derive(Debug,Clone,Copy)]
+pub enum SampleOrderingNorm {
+    // l1 (manhattan) norm
+    L1,
+    // l2 squared (squared euclidian norm)
+    L2,
+    /// infinity norm (chebychev norm)
+    LInf,
+}
+
+
+
+pub struct FlattenSamplesInputs {
+    pub sample_ordering_norm:SampleOrderingNorm,
+    pub file_prefix:String,
+    pub work_dir:PathBuf,
+    pub n_volumes:usize,
+    pub nx:usize,
+    pub phase_encoding_table_path:PathBuf,
+}
+
+pub struct FlattenSamplesOutputs {
+    pub sample_ordering_file:PathBuf,
+    pub file_prefix:String,
+    pub work_dir:PathBuf,
+    pub n_volumes:usize,
+    pub nx:usize,
+}
+
+//cargo test --release --package kspace-mppca --bin kmppca -- flatten --exact --nocapture
+
+pub fn flatten(inputs:FlattenSamplesInputs) -> FlattenSamplesOutputs {
+
+    let nx = inputs.nx;
+    let n_vols = inputs.n_volumes;
+    let pe_table_path = &inputs.phase_encoding_table_path;
+    let work_dir = &inputs.work_dir;
+    let file_prefix = &inputs.file_prefix;
+
+    // defined by this process
+    let sample_ordering_file = "sample_ordering";
+
+    let phase_encoding_coords = ViewTable::from_file(pe_table_path)
+    .unwrap()
+    .coordinate_pairs::<i32>()
+    .unwrap();
+
+    let norm = match inputs.sample_ordering_norm {
+        SampleOrderingNorm::L1 => |kx:i32,ky:i32,kz:i32| -> i32 {
+            kx.abs() + ky.abs() + kz.abs()
+        },
+        SampleOrderingNorm::L2 => |kx:i32,ky:i32,kz:i32| -> i32 {
+            kx*kx + ky*ky + kz*kz
+        },
+        SampleOrderingNorm::LInf => |kx:i32,ky:i32,kz:i32| -> i32 {
+            kx.abs().max(ky.abs()).max(kz.abs())
+        },
+    };
+
+    // determine sample ordering based on some norm of k(r)
+    let mut sample_ordering = vec![];
+    let mut idx = 0;
+    phase_encoding_coords.iter().for_each(|phase_encode|{
+        for kx in k_range(nx) {
+            let l2 = norm(kx,phase_encode[0],phase_encode[1]);
+            sample_ordering.push(
+                SampleOrdering {linear_idx:idx,norm:l2}
+            );
+            idx += 1;
+        }
+    });
+
+    sample_ordering.sort_by_key(|x|x.norm);
+
+    let ordering_file_path = work_dir.join(sample_ordering_file);
+
+    let mut ordering_fle = File::create(&ordering_file_path).unwrap();
+    ordering_fle.write_all(
+        &bincode::serialize(&sample_ordering).unwrap()
+    ).unwrap();
+
+    // sort k-space samples by their coordinate norm and write to 1-D cfl file
+    (0..n_vols).into_par_iter().for_each(|vol_idx|{
+        println!("flattening volume {}",vol_idx);
+        let compressed_kspace_file = work_dir.join(format!("k{vol_idx}"));
+        let a = cfl::to_array(compressed_kspace_file, true).unwrap();
+        let a_slice = a.as_slice_memory_order().unwrap();
+        let mut sorted = Array1::<Complex32>::from_elem(a.len().f(), Complex32::ZERO);
+        sorted.as_slice_memory_order_mut().unwrap()
+        .par_iter_mut()
+        .zip(sample_ordering.par_iter())
+        .for_each(|(elem,order)|{
+            *elem = a_slice[order.linear_idx]
+        });
+        cfl::from_array(work_dir.join(format!("{file_prefix}{vol_idx}")), &sorted.into_dyn()).unwrap();
+    });
+
+    FlattenSamplesOutputs {
+        sample_ordering_file: ordering_file_path,
+        file_prefix:inputs.file_prefix,
+        work_dir: inputs.work_dir,
+        n_volumes: n_vols,
+        nx,
+    }
+
+}
+
+
+
+pub fn estimate_variance(inputs:&DenoiseInputs) -> f32 {
+
+    let chunk_size = inputs.sample_chunk_size;
+    let assumed_variance:Option<f32> = inputs.assumed_variance;
+    let assumed_rank:Option<usize> = inputs.assumed_global_rank;
+
+    // dependencies
+    let n_vols = inputs.n_volumes;
+    let work_dir = &inputs.work_dir;
+    let flattened_file_prefix = &inputs.flattened_file_prefix;
+
+    let dims = cfl::get_dims(work_dir.join(format!("{flattened_file_prefix}{}",0))).unwrap();
+    let samples_per_vol = dims.iter().product();
+
+    let readers:Vec<_> = (0..n_vols).into_par_iter().map(|vol_idx|{
+        CflReader::new(work_dir.join(format!("{flattened_file_prefix}{vol_idx}"))).unwrap()
+    }).collect();
+
+    // sample indices that are segmented and processed by chunks
+    let sample_indices:Vec<usize> = (0..samples_per_vol).collect();
+    
+    let mut n_rank_0 = 0;
+    let mut max_variance = 0.;
+
+    for (i,chunk) in sample_indices.chunks(chunk_size).enumerate() {
+        println!("working on {} of {}",i+1,ceiling_div(samples_per_vol, chunk_size));
+
+        // extract neighborhood from sample readers
+        let mut c_mat = extract_data(&chunk, &readers);
+
+        // reduce noise in casorati matrix via hard-thresholding singular values
+        // return an info struct that contains meta data on what was performed
+        let info = mp_denoise_matrix(&mut c_mat, assumed_variance, assumed_rank);
+
+        // find the max variance over all rank 0 detections
+        if info.rank == 0 {
+            let v = info.variance.unwrap_or(0.);
+            if v > max_variance {
+                max_variance = v;
+            }
+            n_rank_0 += 1;
+        }
+
+    }
+    println!("n rank 0 neighborhoods: {}",n_rank_0);
+    println!("estimated noise variane: {}",max_variance);
+    max_variance
+}
+
+
+
+pub struct UnflattenInputs {
+    pub grid_size:[usize;3],
+    pub sample_ordering_file:PathBuf,
+    pub work_dir:PathBuf,
+    pub n_volumes:usize,
+    pub nx:usize,
+    pub phase_encoding_table_path:PathBuf,
+    pub denoised_file_prefix:String,
+    pub rank_filepath:PathBuf,
+    pub variance_filepath:PathBuf,
+    pub removed_energy_filepath:PathBuf,
+    pub neighborhood_filepath:PathBuf,
+}
+
+
+//cargo test --release --package kspace-mppca --bin kmppca -- unflatten --exact --nocapture
+
+pub fn unflatten(inputs:UnflattenInputs) {
+
+    let phase_encoding_filepath = &inputs.phase_encoding_table_path;
+    let work_dir = &inputs.work_dir;
+    let sample_ordering_file = &inputs.sample_ordering_file;
+    let n_vols = inputs.n_volumes;
+    let denoised_prefix = &inputs.denoised_file_prefix;
+    let nx = inputs.nx;
+    let rank_filepath = &inputs.rank_filepath;
+    let variance_filepath = &inputs.variance_filepath;
+    let removed_energy_filepath = &inputs.removed_energy_filepath;
+    let neighborhood_filepath = &inputs.neighborhood_filepath;
+    let grid_size = &inputs.grid_size;
+
+    let result_prefix = "o";
+
+    let phase_encoding_coords = ViewTable::from_file(phase_encoding_filepath)
+    .unwrap()
+    .coordinate_pairs::<i32>()
+    .unwrap();
+
+    let mut ordering_fle = File::open(sample_ordering_file).unwrap();
+    let mut bytes:Vec<u8> = vec![];
+    ordering_fle.read_to_end(
+        &mut bytes
+    ).unwrap();
+    let sample_ordering:Vec<SampleOrdering> = bincode::deserialize(&bytes).unwrap();
+
+
+    // sort k-space samples by their coordinate norm and write to 1-D cfl file
+    (0..n_vols).into_par_iter().for_each(|vol_idx|{
+        println!("reconstructing volume {}",vol_idx);
+        let denoised_filename = work_dir.join(format!("{denoised_prefix}{vol_idx}"));
+        let result_filename = work_dir.join(format!("{result_prefix}{vol_idx}"));
+        unflatten_grid(&denoised_filename,result_filename,nx,&phase_encoding_coords,&sample_ordering,grid_size);
+    });
+
+    unflatten_grid(rank_filepath,rank_filepath,nx,&phase_encoding_coords,&sample_ordering,grid_size);
+    unflatten_grid(variance_filepath,variance_filepath,nx,&phase_encoding_coords,&sample_ordering,grid_size);
+    unflatten_grid(removed_energy_filepath,removed_energy_filepath,nx,&phase_encoding_coords,&sample_ordering,grid_size);
+    unflatten_grid(neighborhood_filepath,neighborhood_filepath,nx,&phase_encoding_coords,&sample_ordering,grid_size);
+
+}
+
+pub fn unflatten_to_kspace(inputs:UnflattenInputs,kspace_files:&[PathBuf]) {
+
+    let phase_encoding_filepath = &inputs.phase_encoding_table_path;
+    let work_dir = &inputs.work_dir;
+    let sample_ordering_file = &inputs.sample_ordering_file;
+    let n_vols = inputs.n_volumes;
+    let denoised_prefix = &inputs.denoised_file_prefix;
+    let nx = inputs.nx;
+    let rank_filepath = &inputs.rank_filepath;
+    let variance_filepath = &inputs.variance_filepath;
+    let removed_energy_filepath = &inputs.removed_energy_filepath;
+    let neighborhood_filepath = &inputs.neighborhood_filepath;
+    let grid_size = &inputs.grid_size;
+
+    let phase_encoding_coords = ViewTable::from_file(phase_encoding_filepath)
+    .unwrap()
+    .coordinate_pairs::<i32>()
+    .unwrap();
+
+    let mut ordering_fle = File::open(sample_ordering_file).unwrap();
+    let mut bytes:Vec<u8> = vec![];
+    ordering_fle.read_to_end(
+        &mut bytes
+    ).unwrap();
+    let sample_ordering:Vec<SampleOrdering> = bincode::deserialize(&bytes).unwrap();
+
+    assert_eq!(n_vols,kspace_files.len(),"mismatch between number of volumes and specified outputs");
+    // sort k-space samples by their coordinate norm and write to 1-D cfl file
+    (0..n_vols).into_par_iter().zip(kspace_files.par_iter()).for_each(|(vol_idx,kspace_file)|{
+        println!("reconstructing volume {}",vol_idx);
+        let denoised_filename = work_dir.join(format!("{denoised_prefix}{vol_idx}"));
+        unflatten_to_ksp(&denoised_filename,kspace_file,nx,&phase_encoding_coords,&sample_ordering);
+    });
+
+    unflatten_grid(rank_filepath,rank_filepath,nx,&phase_encoding_coords,&sample_ordering,grid_size);
+    unflatten_grid(variance_filepath,variance_filepath,nx,&phase_encoding_coords,&sample_ordering,grid_size);
+    unflatten_grid(removed_energy_filepath,removed_energy_filepath,nx,&phase_encoding_coords,&sample_ordering,grid_size);
+    unflatten_grid(neighborhood_filepath,neighborhood_filepath,nx,&phase_encoding_coords,&sample_ordering,grid_size);
+}
+
+/// unflattens a 1-D cfl into a grid
+fn unflatten_grid(file_name:impl AsRef<Path>,output_filename:impl AsRef<Path>,nx:usize,phase_encoding_coords:&[[i32;2]],sample_ordering:&[SampleOrdering],grid_size:&[usize]) {
+    let rank = cfl::to_array(&file_name,true).unwrap();
+    let mut recon_2d = Array2::<Complex32>::from_elem((nx,phase_encoding_coords.len()).f(), Complex32::ZERO);
+    let r_slice = recon_2d.as_slice_memory_order_mut().unwrap();
+    rank.as_slice_memory_order().unwrap()
+    .iter()
+    .zip(sample_ordering.iter())
+    .for_each(|(elem,order)|{
+        r_slice[order.linear_idx] = *elem;
+    });
+    let gridded = KSpace::from_array2(recon_2d,&phase_encoding_coords).grid(&grid_size);
+    cfl::from_array(output_filename, &gridded.into_dyn()).unwrap();
+}
+
+fn unflatten_to_ksp(file_name:impl AsRef<Path>,output_filename:impl AsRef<Path>,nx:usize,phase_encoding_coords:&[[i32;2]],sample_ordering:&[SampleOrdering]) {
+    let rank = cfl::to_array(&file_name,true).unwrap();
+    let mut recon_2d = Array2::<Complex32>::from_elem((nx,phase_encoding_coords.len()).f(), Complex32::ZERO);
+    let r_slice = recon_2d.as_slice_memory_order_mut().unwrap();
+    rank.as_slice_memory_order().unwrap()
+    .iter()
+    .zip(sample_ordering.iter())
+    .for_each(|(elem,order)|{
+        r_slice[order.linear_idx] = *elem;
+    });
+    let ksp = KSpace::from_array2(recon_2d,&phase_encoding_coords);
+    ksp.write_to_file(output_filename).unwrap();
+}
+
+pub struct DenoiseInputs {
+    pub sample_chunk_size:usize,
+    pub assumed_variance:Option<f32>,
+    pub assumed_global_rank:Option<usize>,
+    pub flattened_file_prefix:String,
+    pub work_dir:PathBuf,
+    pub n_volumes:usize,
+}
+
+pub struct DenoiseOutputs {
+    pub work_dir:PathBuf,
+    pub n_volumes:usize,
+    pub denoised_file_prefix:String,
+    pub rank_filepath:PathBuf,
+    pub variance_filepath:PathBuf,
+    pub removed_energy_filepath:PathBuf,
+    pub neighborhood_filepath:PathBuf,
+}
+
+//cargo test --release --package kspace-mppca --bin kmppca -- reduce_noise --exact --nocapture
+pub fn reduce_noise(inputs:DenoiseInputs) -> DenoiseOutputs {
+
+    // defined by process
+    let chunk_size = inputs.sample_chunk_size;
+    let assumed_variance:Option<f32> = inputs.assumed_variance;
+    let assumed_rank:Option<usize> = inputs.assumed_global_rank;
+
+    let denoised_file_prefix = "fd";
+    let rank_filename = "rank";
+    let variance_filename = "variance";
+    let removed_energy_filename = "removed_energy";
+    let neighborhood_filename = "low_rank_neighborhood";
+
+    // dependencies
+    let n_vols = inputs.n_volumes;
+    let work_dir = &inputs.work_dir;
+    let flattened_file_prefix = &inputs.flattened_file_prefix;
+
+    let dims = cfl::get_dims(work_dir.join(format!("{flattened_file_prefix}{}",0))).unwrap();
+    let samples_per_vol = dims.iter().product();
+
+    let readers:Vec<_> = (0..n_vols).into_par_iter().map(|vol_idx|{
+        CflReader::new(work_dir.join(format!("{flattened_file_prefix}{vol_idx}"))).unwrap()
+    }).collect();
+
+    let mut writers:Vec<_> = (0..n_vols).into_par_iter().map(|vol_idx|{
+        CflWriter::new(work_dir.join(format!("{denoised_file_prefix}{vol_idx}")),&[samples_per_vol]).unwrap()
+    }).collect();
+
+    let rank_filepath = work_dir.join(rank_filename);
+    let mut rank = CflWriter::new(&rank_filepath,&[samples_per_vol]).unwrap();
+    let mut rank_tmp = vec![Complex32::ZERO;chunk_size];
+
+    let variance_filepath = work_dir.join(variance_filename);
+    let mut var = CflWriter::new(&variance_filepath,&[samples_per_vol]).unwrap();
+    let mut var_tmp = vec![Complex32::ZERO;chunk_size];
+
+    let removed_energy_filepath = work_dir.join(removed_energy_filename);
+    let mut removed_energy = CflWriter::new(&removed_energy_filepath,&[samples_per_vol]).unwrap();
+    let mut removed_energy_tmp = vec![Complex32::ZERO;chunk_size];
+
+    let neighborhood_filepath = work_dir.join(neighborhood_filename);
+    let mut low_rank_neighborhood = CflWriter::new(&neighborhood_filepath,&[samples_per_vol]).unwrap();
+    let mut low_rank_neighborhood_tmp = vec![Complex32::ZERO;chunk_size];
+    
+    // sample indices that are segmented and processed by chunks
+    let sample_indices:Vec<usize> = (0..samples_per_vol).collect();
+    
+    for (i,chunk) in sample_indices.chunks(chunk_size).enumerate() {
+        println!("working on {} of {}",i+1,ceiling_div(samples_per_vol, chunk_size));
+
+        // extract neighborhood from sample readers
+        let mut c_mat = extract_data(&chunk, &readers);
+
+        // reduce noise in casorati matrix via hard-thresholding singular values
+        // return an info struct that contains meta data on what was performed
+        let info = mp_denoise_matrix(&mut c_mat, assumed_variance, assumed_rank);
+
+        // write the measured (or assumed low-rank) approximation
+        rank_tmp.fill(Complex32::new(info.rank as f32,0.));
+        rank.write_from(chunk,&rank_tmp).unwrap();
+
+        // write the measured (or assumed) variance
+        var_tmp.fill(Complex32::new(info.variance.unwrap_or(0.) as f32,0.));
+        var.write_from(chunk,&var_tmp).unwrap();
+
+        // write the removed energy
+        removed_energy_tmp.fill(Complex32::new(info.init_energy - info.final_energy,0.));
+        removed_energy.write_from(chunk,&removed_energy_tmp).unwrap();
+
+        // write the neighborhood index
+        low_rank_neighborhood_tmp.fill(Complex32::new(i as f32,0.));
+        low_rank_neighborhood.write_from(chunk,&low_rank_neighborhood_tmp).unwrap();
+
+        insert_data(&chunk, &mut writers, &c_mat);
+
+    }
+
+    DenoiseOutputs {
+        work_dir: inputs.work_dir,
+        n_volumes: n_vols,
+        denoised_file_prefix: denoised_file_prefix.to_string(),
+        rank_filepath,
+        variance_filepath,
+        removed_energy_filepath,
+        neighborhood_filepath,
+    }
+
+}
+
+fn k_range(n:usize) -> Range<i32> {
+    assert!(n!=0,"n must be greater than 0");
+    if n%2 == 0 {
+        -((n/2) as i32) .. ((n/2) as i32)
+    }else {
+        -((n/2) as i32) .. ceiling_div(n, 2) as i32
+    }
+}
+
+pub fn ceiling_div(a:usize,b:usize) -> usize {
+    (a + b - 1) / b
+}
+
+#[derive(Serialize,Deserialize)]
+struct SampleOrdering {
+    linear_idx:usize,
+    // value of the norm that is used to rank the samples
+    norm:i32,
 }
