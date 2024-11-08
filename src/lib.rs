@@ -629,7 +629,6 @@ pub fn estimate_variance(inputs:&DenoiseInputs) -> f32 {
 
 
 pub struct UnflattenInputs {
-    pub grid_size:[usize;3],
     pub sample_ordering_file:PathBuf,
     pub work_dir:PathBuf,
     pub n_volumes:usize,
@@ -645,7 +644,7 @@ pub struct UnflattenInputs {
 
 //cargo test --release --package kspace-mppca --bin kmppca -- unflatten --exact --nocapture
 
-pub fn unflatten(inputs:UnflattenInputs) {
+pub fn unflatten(inputs:UnflattenInputs, grid_size:&[usize]) {
 
     let phase_encoding_filepath = &inputs.phase_encoding_table_path;
     let work_dir = &inputs.work_dir;
@@ -657,7 +656,6 @@ pub fn unflatten(inputs:UnflattenInputs) {
     let variance_filepath = &inputs.variance_filepath;
     let removed_energy_filepath = &inputs.removed_energy_filepath;
     let neighborhood_filepath = &inputs.neighborhood_filepath;
-    let grid_size = &inputs.grid_size;
 
     let result_prefix = "o";
 
@@ -689,7 +687,7 @@ pub fn unflatten(inputs:UnflattenInputs) {
 
 }
 
-pub fn unflatten_to_kspace(inputs:UnflattenInputs,kspace_files:&[PathBuf]) {
+pub fn unflatten_to_kspace(inputs:UnflattenInputs,kspace_files:&[PathBuf],grid_size:&[usize]) {
 
     let phase_encoding_filepath = &inputs.phase_encoding_table_path;
     let work_dir = &inputs.work_dir;
@@ -701,7 +699,6 @@ pub fn unflatten_to_kspace(inputs:UnflattenInputs,kspace_files:&[PathBuf]) {
     let variance_filepath = &inputs.variance_filepath;
     let removed_energy_filepath = &inputs.removed_energy_filepath;
     let neighborhood_filepath = &inputs.neighborhood_filepath;
-    let grid_size = &inputs.grid_size;
 
     let phase_encoding_coords = ViewTable::from_file(phase_encoding_filepath)
     .unwrap()
